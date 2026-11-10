@@ -225,8 +225,9 @@ export function slackCommand(deps: SlackDeps = {}): Command {
       const s = resolveSecrets(surface, cfg);
       const readiness = surface.staticReadiness(cfg, s.bot !== null, s.app !== null);
       const permWarn = cfg.secretsEnvFile ? surface.checkEnvFilePermissions(cfg.secretsEnvFile) : null;
-      // A channel-map warning (#192) is not missing setup: it must not send the operator to the manifest.
-      const unconfigured = readiness.some((r) => !r.ok && r.label !== "channel-map");
+      // A channel-map warning (#192) or a seat bot token that fell back to the shared app is not missing
+      // setup: it must not send the operator to the manifest.
+      const unconfigured = readiness.some((r) => !r.ok && r.label !== "channel-map" && r.label !== "seat-bots");
       const next = unconfigured ? `First step: ${MANIFEST_FIRST_STEP}.` : null;
       let observation: Record<string, unknown> = { state: "unknown", reason: "daemon-unavailable" };
       let timer: ReturnType<typeof setTimeout> | undefined;

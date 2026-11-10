@@ -7,7 +7,7 @@ import { resolveRegisteredHumanAddress } from "../human-registry.js";
 import { callWebApi, type FetchImpl, type WebApiResult } from "./slack-api.js";
 import { budgetLeft, HISTORY, REPLIES, MethodBackoff, newRecoveryBudget } from "./recovery-budget.js";
 import { parsePostedStamp } from "./thread-seat-map.js";
-import { TYPED_REPLY_HINT, CHANNEL_REPLY_HINT, HUMAN_REQUIRED_REPLY_HINT, QUESTION_BLOCK_PREFIX, escapeSlackText, redactSecrets } from "./message.js";
+import { TYPED_REPLY_HINT, CHANNEL_REPLY_HINT, HUMAN_REQUIRED_REPLY_HINT, SEAT_TYPED_REPLY_HINT, SEAT_TYPED_REPLY_HINT_MANY, QUESTION_BLOCK_PREFIX, escapeSlackText, redactSecrets } from "./message.js";
 
 const UPDATE = "chat.update";
 const EDITED = "slack-ask-settled";
@@ -15,7 +15,8 @@ const RATE_LIMIT = "slack-ask-edit-rate-limit";
 const STATUS_BLOCK = "or-settled";
 const permanentErrors = new Set(["missing_scope", "not_in_channel", "channel_not_found", "is_archived",
   "cant_update_message", "invalid_blocks", "message_not_found", "thread_not_found", "original message unavailable"]);
-const hints = new Set([TYPED_REPLY_HINT, CHANNEL_REPLY_HINT, HUMAN_REQUIRED_REPLY_HINT]);
+// Per-seat bot tokens: a seat-posted ask carries a typed-reply hint instead of buttons; settling removes it too.
+const hints = new Set([TYPED_REPLY_HINT, CHANNEL_REPLY_HINT, HUMAN_REQUIRED_REPLY_HINT, SEAT_TYPED_REPLY_HINT, SEAT_TYPED_REPLY_HINT_MANY]);
 const terminal = new Set(["done", "canceled", "denied", "failed", "handed-off"]);
 const field = (note: string, key: string) => note.split(/\s+/).find((part) => part.startsWith(`${key}=`))?.slice(key.length + 1);
 type Block = { type?: string; block_id?: string; elements?: Array<{ text?: string }>; [key: string]: unknown };
@@ -63,7 +64,11 @@ export class SlackAskSettlement {
   private stopped = true;
   private lastFailure: string | null = null;
 
-  constructor(private readonly opts: { queue: QueueRepository; token: string; fetchImpl?: FetchImpl; log: (message: string) => void }) {}
+  /** `token` is the shared app's: it reads the original message. `updateTokensFor` (per-seat bot tokens)
+   *  names, for the seat that asked, the tokens that may have POSTED it, most likely first: chat.update
+   *  only works for the posting bot, and the stamp doesn't record which token posted (an ask with buttons
+   *  stays on the shared app; a token can be added or removed between post and edit). Absent = `[token]`. */
+  constructor(private readonly opts: { queue: QueueRepository; token: string; updateTokensFor?: (seat: string) => string[]; fetchImpl?: FetchImpl; log: (message: string) => void }) {}
 
   start(): void {
     this.stopped = false;
@@ -122,11 +127,11 @@ export class SlackAskSettlement {
     } finally { this.running = false; }
   }
 
-  private async api(method: string, body: Record<string, unknown>): Promise<WebApiResult> {
+  private async api(method: string, body: Record<string, unknown>, token = this.opts.token): Promise<WebApiResult> {
     this.budget.calls++;
     const fetchImpl: FetchImpl = (url, init) => (this.opts.fetchImpl ?? fetch)(url, { ...init,
       signal: init?.signal ? AbortSignal.any([init.signal, this.controller.signal]) : this.controller.signal });
-    return callWebApi(method, this.opts.token, body, fetchImpl, Math.max(1, this.budget.deadline - Date.now()),
+    return callWebApi(method, token, body, fetchImpl, Math.max(1, this.budget.deadline - Date.now()),
       method === HISTORY || method === REPLIES ? "get-query" : "json-post");
   }
 
@@ -226,7 +231,14 @@ export class SlackAskSettlement {
       // A queue change during the read may add information; derive again before writing.
       const current = this.desired(id, episode, stamp.human, this.opts.queue.transitionLog.listForQitem(id));
       if (!current || this.stopped) return null;
-      const update = await this.api(UPDATE, { channel: stamp.channel, ts: messageTs, ...handledMessage(message, current.status) });
+      const edit = { channel: stamp.channel, ts: messageTs, ...handledMessage(message, current.status) };
+      const tokens = this.opts.updateTokensFor?.(stamp.seat) ?? [this.opts.token];
+      let update = await this.api(UPDATE, edit, tokens[0]);
+      // Not this bot's message: the next token that may have posted it. Each try counts against the budget.
+      for (const next of tokens.slice(1)) {
+        if (update.ok || update.error !== "cant_update_message" || this.stopped) break;
+        update = await this.api(UPDATE, edit, next);
+      }
       if (this.stopped) return null;
       if (!update.ok) return this.failed(id, edited, UPDATE, update);
       if (update.json.ts !== messageTs || update.json.channel !== stamp.channel) {

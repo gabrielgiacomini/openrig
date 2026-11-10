@@ -174,6 +174,19 @@ export async function getGrantedScopes(
   return { ok: r.ok, granted: r.grantedScopes, error: r.error };
 }
 
+/** Per-seat bot tokens: who a bot token posts as (`auth.test`): its bot user, its bot ID and, when Slack
+ *  says, its app. No scope needed. The token is never echoed into the error. */
+export async function identifyBot(
+  token: string,
+  fetchImpl: FetchImpl = defaultFetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<{ ok: true; userId?: string; botId?: string; appId?: string } | { ok: false; error: string }> {
+  const r = await callWebApi("auth.test", token, {}, fetchImpl, timeoutMs);
+  if (!r.ok) return { ok: false, error: r.error ?? "auth.test failed" };
+  const str = (v: unknown) => (typeof v === "string" && v ? v : undefined);
+  return { ok: true, userId: str(r.json.user_id), botId: str(r.json.bot_id), appId: str(r.json.app_id) };
+}
+
 /** Named-bot delivery: the app a bot's posts belong to (`bots.info`, needs `users:read`). A transport,
  *  rate-limit or server failure is retryable; Slack's own refusal (`missing_scope`, `bot_not_found`) is not. */
 export async function lookupBotApp(

@@ -13,6 +13,7 @@ import { BASELINE_REQUIRED_SCOPES } from "./capabilities.js";
 import { unsupportedChannelMapFields, validateChannelMap, type ChannelMapEntry } from "./channel-map.js";
 import { botInboxProblems, type BotInboxConfig } from "./bot-inbox.js";
 import { forwardChannelProblems, type ForwardChannel } from "./forwarding.js";
+import { loadSeatPosters } from "./seat-tokens.js";
 
 export interface SlackConnectorConfig {
   enabled: boolean;
@@ -149,9 +150,20 @@ export function staticReadiness(cfg: SlackConnectorConfig, hasBotToken: boolean,
     { ok: Boolean(cfg.inboundDestination), label: "inbound-destination", detail: cfg.inboundDestination },
     { ok: cfg.enabled, label: "enabled", detail: cfg.enabled ? "yes" : "no (run `rig slack enable`)" },
     ...channelMapReadiness(cfg),
+    ...seatBotReadiness(cfg),
     ...botInboxReadiness(cfg),
     ...forwardReadiness(cfg),
   ];
+}
+
+/** One row only when a channel-map entry names its own bot token: how many load, and why any fall back
+ *  to the shared token. Reads the env files' mode and key names, never prints a value. */
+function seatBotReadiness(cfg: SlackConnectorConfig): ReadinessItem[] {
+  const named = (cfg.channelMap ?? []).filter((e) => e.outboundSecretsEnvFile !== undefined).length;
+  if (!named) return [];
+  const { posters, problems } = loadSeatPosters(cfg);
+  const summary = `${posters.length} of ${named} seat bot token(s) loaded; their posts use their own app, inbound stays on the shared app`;
+  return [{ ok: problems.length === 0, label: "seat-bots", detail: problems.length ? `${summary}; ${problems.join("; ")}` : summary }];
 }
 
 /** One row only when a bot inbox is set: what it delivers, or why it is off. */

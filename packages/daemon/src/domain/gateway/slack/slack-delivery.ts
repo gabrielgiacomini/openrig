@@ -25,9 +25,26 @@ import type { SeenStore } from "./state-store.js";
 import type { OutboundDecision } from "../protocol.js";
 import type { SubsystemDeliverFn, SubsystemDeliveryOutcome } from "../gateway-subsystem.js";
 import type { OutboundPostPayload } from "./outbound-driver.js";
+import { SEAT_TOKEN_FALLBACK_ERRORS } from "./seat-tokens.js";
+
+/** Per-seat bot tokens: who a payload is posted as. Absent = the shared app (`botToken`). */
+export interface SlackPoster {
+  /** The seat app's bot token. Never logged. */
+  token: string;
+  /** For logs: the channel-map match it speaks for (never the token). */
+  label: string;
+  /** Registered people a `<@U…>` in this payload's body may mention live (message.ts). */
+  allowedMentionUserIds?: ReadonlySet<string>;
+}
 
 export interface SubsystemSlackDeliveryOpts {
+  /** The shared app's bot token: every read (reconcile scans) and every post without a seat poster. */
   botToken: string;
+  /** Per-seat bot tokens: the identity this payload posts as, decided once per decision from the whole
+   *  payload, so every part of a split ask keeps one identity. A payload posted as a seat renders its
+   *  questions as text answered by a typed thread reply (a seat app can't receive clicks). A definite
+   *  refusal of the seat token (SEAT_TOKEN_FALLBACK_ERRORS) retries once with `botToken`, same render. */
+  resolvePoster?: (payload: OutboundPostPayload) => SlackPoster | undefined;
   /** The default channel: every post goes here unless resolveChannel names another. */
   channel: string;
   /** #192: the channel for this payload (the channel map). Absent = `channel` for every post.
@@ -242,6 +259,8 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
       return { ok: true };
     }
     const q = (decision.payload ?? {}) as DeliveryPart;
+    // Per-seat bot tokens: the identity this post goes out as (undefined = the shared app).
+    const poster = opts.resolvePoster?.(q);
     // #192: the channel first, from this post's record when it has one, so the thread below is
     // chosen inside the channel the post actually goes to (and went to, on a retry).
     const pinned = firstAttemptChannel(opts, opts.attempted.load(), decision.decisionId);
@@ -314,6 +333,9 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
           attribution: attributionFromSession(q.sourceSession),
           machine: opts.machine?.() ?? undefined,
           mentionUserId: opts.resolveMentionUserId?.(q),
+          allowedMentionUserIds: poster?.allowedMentionUserIds,
+          // Per-seat bot tokens: a seat app can't receive clicks, so its asks are answered by a typed reply.
+          typedAnswersOnly: poster !== undefined,
           // fix-r3 — the reconcile identity, reserved outside the clamp budget (same function
           // the scan above matches: one identity, same bytes, both sides).
           reconcileMarker: reconcileToken(decision.decisionId),
@@ -418,13 +440,22 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
       opts.attempted.mark(`${attemptPrefix}${payloadHash()}::${randomUUID()}`, "payload-attempted");
     }
     const stopSignal = opts.stopSignal;
-    const res = await postChatMessage(
-      opts.botToken,
+    const send = (token: string) => postChatMessage(
+      token,
       input,
       opts.fetchImpl,
       undefined,
       stopSignal ? (ms: number) => abortableSleep(ms, stopSignal) : undefined,
     );
+    let res = await send(poster?.token ?? opts.botToken);
+    let postedAs = poster;
+    if (poster && !res.ok && res.status === 200 && SEAT_TOKEN_FALLBACK_ERRORS.has(res.error ?? "")) {
+      // Slack definitely refused the seat token (not in the channel, revoked, missing scope): nothing
+      // was posted, so one post with the shared app can't double-post. Loud, never silent.
+      log(`seat bot for ${poster.label} refused (${res.error}) for ${q.qitemId ?? decision.decisionId}; posting with the shared app instead`);
+      res = await send(opts.botToken);
+      postedAs = undefined;
+    }
     if (!res.ok) {
       const permanent = res.status === 200 && res.error === "invalid_blocks";
       const failureClass = permanent ? INVALID_BLOCKS_CLASS : res.status === 0 ? "transport" : `http-${res.status}`;
@@ -507,12 +538,19 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
       log(`ATTACHMENT skipped for ${q.qitemId ?? decision.decisionId}: ${path.basename(String(q.evidenceRef))} ${local.skipped} (text delivered; attachment missing)`);
     } else if (local) {
       const intoThread = placedThreadTs ?? res.ts;
-      const up = await getUploadURLExternal(opts.botToken, local.filename, local.bytes.length, opts.fetchImpl);
+      // The file goes up as whoever posted the text; a seat app without files:write falls back to the shared app.
+      let uploadToken = postedAs?.token ?? opts.botToken;
+      let up = await getUploadURLExternal(uploadToken, local.filename, local.bytes.length, opts.fetchImpl);
+      if (!up.ok && uploadToken !== opts.botToken) {
+        log(`seat bot upload-url refused (${up.error}) for ${q.qitemId ?? decision.decisionId}; uploading with the shared app instead`);
+        uploadToken = opts.botToken;
+        up = await getUploadURLExternal(uploadToken, local.filename, local.bytes.length, opts.fetchImpl);
+      }
       if (up.ok && up.uploadUrl && up.fileId) {
         const put = await uploadBytesExternal(up.uploadUrl, local.bytes, opts.fetchImpl);
         if (put.ok) {
           const done = await completeUploadExternal(
-            opts.botToken,
+            uploadToken,
             // #300: the title is shown in Slack like the text, so it gets the same secret redaction.
             { files: [{ id: up.fileId, title: redactSecrets(q.summary ?? local.filename) }], channelId: channel, threadTs: intoThread },
             opts.fetchImpl,
@@ -590,11 +628,14 @@ function renderPart(opts: SubsystemSlackDeliveryOpts, q: DeliveryPart, part: Del
   // #47 — preflight must mirror deliverSinglePart exactly: the same evidenceRef
   // split (image attachment vs. plain link) so the shape check sees the true payload.
   const partEvidence = evidenceAttachment(part.media, part.evidenceRef, part.summary);
+  const poster = opts.resolvePoster?.(q);
   return buildOutboundMessage(part, {
     sourceLabel: opts.sourceLabel,
     attribution: attributionFromSession(part.sourceSession),
     machine: opts.machine?.() ?? undefined,
     mentionUserId: index === 0 ? opts.resolveMentionUserId?.(q) : undefined,
+    allowedMentionUserIds: poster?.allowedMentionUserIds,
+    typedAnswersOnly: poster !== undefined,
     reconcileMarker: reconcileToken(partId),
     mediaRefs: partEvidence.mediaRefs,
     evidenceLink: partEvidence.evidenceLink,
@@ -680,6 +721,10 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
   const fn: SubsystemDeliverFn = async (decision) => {
     if (opts.delivered.load().has(decision.decisionId)) return { ok: true };
     const q = (decision.payload ?? {}) as DeliveryPart;
+    // Per-seat bot tokens: one identity for every part of this decision, decided from the whole payload
+    // (an ask's questions ride its first part only, and its later parts must not switch identity).
+    const poster = opts.resolvePoster?.(q);
+    const withPoster = (o: SubsystemSlackDeliveryOpts): SubsystemSlackDeliveryOpts => (o.resolvePoster ? { ...o, resolvePoster: () => poster } : o);
     let parts: DeliveryPart[] = q.humanDetail
       ? [
           { ...q, humanDetail: undefined, body: `${q.body ?? ""}\n\n${DETAIL_NOTE}` },
@@ -697,7 +742,7 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
     /** The parts a plan renders to, preflighted; with no plan, decide one from the real render. */
     const choose = (kept?: DeliveryPlan) => {
       const mention = kept ? kept.mention : opts.resolveMentionUserId?.(q);
-      const planned: SubsystemSlackDeliveryOpts = { ...opts, resolveMentionUserId: () => mention };
+      const planned: SubsystemSlackDeliveryOpts = withPoster({ ...opts, resolveMentionUserId: () => mention });
       // A kept plan checks only the parts still to post: delivered parts are acknowledged, never rendered again.
       const delivered = kept ? opts.delivered.load() : new Set<string>();
       const preflight = (candidate: DeliveryPart[]) => {
@@ -742,7 +787,7 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
           // #899 — the one message is the whole ask, and it is in Slack: acknowledge it through the
           // reconcile receipt, which finds it by marker before rendering, instead of refusing it.
           const keptMention = recorded.mention;
-          return await deliverSinglePart({ ...opts, resolveMentionUserId: () => keptMention })(decision);
+          return await deliverSinglePart(withPoster({ ...opts, resolveMentionUserId: () => keptMention }))(decision);
         }
         if (partlyPosted) throw error;
         chosen = choose();

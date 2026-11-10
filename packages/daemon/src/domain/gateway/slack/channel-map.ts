@@ -20,6 +20,14 @@ export interface ChannelMapEntry {
   /** The seat a person's new message in this channel goes to. Absent: for a rig entry, the rig's
    *  representative; for a seat entry, `inboundDestination`. */
   inbound?: string;
+  /** Optional: a 0600 env file holding only SLACK_BOT_TOKEN for this seat's (or rig's) own Slack app.
+   *  Its posts then use that token (seat-tokens.ts); absent = the shared bot token, as before. */
+  outboundSecretsEnvFile?: string;
+  /** Optional: that app's ID (A…), so its posts are dropped inbound even before auth.test answers. */
+  appId?: string;
+  /** Optional, needs `outboundSecretsEnvFile`: a `<@U…>` naming a registered person stays a live
+   *  mention in this seat's posts. Everything else (`<!here>`, `<!channel>`, other users) stays escaped. */
+  allowHumanMentions?: boolean;
 }
 
 export interface ChannelMapConfig {
@@ -27,7 +35,7 @@ export interface ChannelMapConfig {
   channelMap?: ChannelMapEntry[];
 }
 
-const ENTRY_KEYS = new Set(["match", "channel", "inbound"]);
+const ENTRY_KEYS = new Set(["match", "channel", "inbound", "outboundSecretsEnvFile", "appId", "allowHumanMentions"]);
 
 function isSeatMatch(match: string): boolean {
   return match.includes("@");
@@ -78,6 +86,19 @@ export function validateChannelMap(cfg: ChannelMapConfig, opts: { allowUnknownFi
     const inbound = (entry as { inbound?: unknown }).inbound;
     if (inbound !== undefined && (typeof inbound !== "string" || parseSessionName(inbound).kind !== "canonical")) {
       throw new Error(`${where}.inbound must be a seat (member@rig) for '${match}'`);
+    }
+    const { outboundSecretsEnvFile, appId, allowHumanMentions } = entry as { outboundSecretsEnvFile?: unknown; appId?: unknown; allowHumanMentions?: unknown };
+    if (outboundSecretsEnvFile !== undefined && (typeof outboundSecretsEnvFile !== "string" || !outboundSecretsEnvFile.startsWith("/"))) {
+      throw new Error(`${where}.outboundSecretsEnvFile must be an absolute path to a 0600 env file holding SLACK_BOT_TOKEN for '${match}'`);
+    }
+    if (appId !== undefined && (typeof appId !== "string" || !/^A[A-Z0-9]+$/.test(appId))) {
+      throw new Error(`${where}.appId must be a Slack app ID (starts with A) for '${match}'`);
+    }
+    if (allowHumanMentions !== undefined && typeof allowHumanMentions !== "boolean") {
+      throw new Error(`${where}.allowHumanMentions must be true or false for '${match}'`);
+    }
+    if (allowHumanMentions === true && outboundSecretsEnvFile === undefined) {
+      throw new Error(`${where}.allowHumanMentions needs outboundSecretsEnvFile: live mentions are only for a seat's own bot for '${match}'`);
     }
     if (seen.has(match)) throw new Error(`channelMap has two entries for '${match}': edit slack-connector.json by hand and keep one entry`);
     seen.add(match);
@@ -148,8 +169,19 @@ export function resolveInboundChannelDestination(
 
 /** Add or replace the entry for `match` (CLI `channel-map set`), keeping its position. */
 export function setChannelMapEntry(map: readonly ChannelMapEntry[] | undefined, entry: ChannelMapEntry): ChannelMapEntry[] {
-  const authored: ChannelMapEntry = { match: entry.match, channel: entry.channel, ...(entry.inbound ? { inbound: entry.inbound } : {}) };
   const current = map ?? [];
+  // A seat's own-bot settings are hand-authored; re-setting its channel or inbound keeps them.
+  const previous = current.find((e) => e.match === entry.match);
+  const identity: Partial<ChannelMapEntry> = entry.outboundSecretsEnvFile !== undefined || entry.appId !== undefined || entry.allowHumanMentions !== undefined
+    ? entry : previous ?? ({} as Partial<ChannelMapEntry>);
+  const authored: ChannelMapEntry = {
+    match: entry.match,
+    channel: entry.channel,
+    ...(entry.inbound ? { inbound: entry.inbound } : {}),
+    ...(identity.outboundSecretsEnvFile !== undefined ? { outboundSecretsEnvFile: identity.outboundSecretsEnvFile } : {}),
+    ...(identity.appId !== undefined ? { appId: identity.appId } : {}),
+    ...(identity.allowHumanMentions !== undefined ? { allowHumanMentions: identity.allowHumanMentions } : {}),
+  };
   return current.some((e) => e.match === entry.match)
     ? current.map((e) => (e.match === entry.match ? authored : e))
     : [...current, authored];

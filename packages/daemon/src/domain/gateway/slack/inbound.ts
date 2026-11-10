@@ -20,6 +20,7 @@ import { escapeSlackText, parseQuestionAction, redactSecrets } from "./message.j
 import { humanAnswerText, formatHumanAnswers, unansweredQuestions, type RecordHumanAnswerResult } from "../../human-questions.js";
 import { BotLimiter, DEFAULT_MAX_PER_HOUR, DEFAULT_COOLDOWN_MINUTES, type BotLookup, type NamedBot } from "./bot-inbox.js";
 import { envelopeChannel, type EnvelopeForwarder } from "./forwarding.js";
+import type { SeatIdentities } from "./seat-tokens.js";
 
 /** On a row whose body OpenRig gave an attachments block (local copies, failed transfers): the block's exact length, so
  *  a person-facing post can leave out that block, and only it (queue-access.ts). */
@@ -32,6 +33,9 @@ export interface SlackEvent {
   subtype?: string;
   user?: string;
   bot_id?: string;
+  /** The posting app, when Slack includes it (bot posts): read only to drop a seat app's own posts. */
+  app_id?: string;
+  bot_profile?: { app_id?: string };
   text?: string;
   ts?: string;
   /** S10 thread routing: present on a threaded reply (= the PARENT root's ts). Absent on a
@@ -220,6 +224,9 @@ export interface InboundDeps {
   sourceLabel?: string;
   /** Named-bot delivery (bot-inbox.ts). Absent → every bot post is dropped. */
   botInbox?: { channel: string; destination: string; bots: NamedBot[]; lookupBot: BotLookup };
+  /** Per-seat bot tokens (seat-tokens.ts): the seat apps OpenRig posts as. Their posts are OpenRig's
+   *  own, like the shared app's: never a person's message, a reaction, or a named bot's post. */
+  seatIdentities?: SeatIdentities;
   /** The clock the per-bot limits read. */
   now?: () => number;
   /** The shared app across machines (forwarding.ts): an envelope for a channel another machine owns
@@ -491,6 +498,7 @@ export class InboundRouter {
     correlationQitemId?: string;
     replyResolution?: "resolved" | "resolved-uncertain" | "already-resolved" | "not-applicable";
   }> {
+    if (this.isSeatPost(ev)) return { landed: false, disposition: "ignored", reason: "own-seat-app" };
     const r = await this.attemptLand(ev, isCurrent);
     if (!r.landed && (r.reason === "create_failed" || r.reason === "resolve_failed")) {
       this.deps.deadLetter.append(ev, attempts + 1);
@@ -650,6 +658,7 @@ export class InboundRouter {
    * dead-lettered and retried like a message.
    */
   async routeReaction(ev: SlackEvent, attempts = 0): Promise<{ status: InboundDisposition; reason?: string }> {
+    if (this.isSeatPost(ev)) return { status: "ignored", reason: "own-seat-app" };
     const r = await this.attemptReaction(ev);
     if (r.status !== "handler-failed") return r;
     this.deps.deadLetter.append(ev, attempts + 1);
@@ -713,6 +722,11 @@ export class InboundRouter {
     }
     this.deps.log?.(`reaction :${ev.reaction}: on ${ask} -> ${route.destination}`);
     return { status: "accepted", reason: "reaction" };
+  }
+
+  /** Per-seat bot tokens: whether this event was authored by one of the seat apps OpenRig posts as. */
+  isSeatPost(ev: SlackEvent): boolean {
+    return this.deps.seatIdentities?.authored(ev) ?? false;
   }
 
   /** Whether a bot's post in this channel is heard: only in the configured bot inbox. */
@@ -780,8 +794,9 @@ export class InboundRouter {
         appId = found.appId;
         this.botApps.set(ev.bot_id, appId);
       }
-      // OpenRig's own posts are never delivered, whatever the config names.
-      if (!ev.receivingAppId || appId === ev.receivingAppId) {
+      // OpenRig's own posts are never delivered, whatever the config names: the shared app's and,
+      // with per-seat bot tokens, every seat app's.
+      if (!ev.receivingAppId || appId === ev.receivingAppId || this.deps.seatIdentities?.appIds.has(appId)) {
         this.deps.log?.(`bot post ignored channel=${ev.channel} app=${appId}: ${ev.receivingAppId ? "OpenRig's own app" : "receiving app unknown"}`);
         return { status: "ignored", reason: "own-app" };
       }
@@ -1075,6 +1090,11 @@ export async function handleEnvelope(
   if (env.type !== "events_api") return { status: "ignored", reason: "envelope-type" };
   // Only history admission supplies recovery provenance; only the envelope names the receiving app.
   const ev = { ...env.payload?.event, recoveredAfterGap: undefined, recoveredThreadReply: undefined, receivingAppId: env.payload?.api_app_id, botAdmitted: undefined };
+  // Per-seat bot tokens: a seat app's own post (its echo) is OpenRig's, dropped before any route.
+  if (router.isSeatPost(ev)) {
+    log?.(`ignored own seat-app post type=${ev.type ?? "-"} channel=${ev.channel ?? "-"} reason=own-seat-app`);
+    return { status: "ignored", reason: "own-seat-app" };
+  }
   // A bot's post in the bot inbox; every other bot post stays dropped by ingestDecision.
   if (ev.bot_id && router.hearsBotsIn(ev.channel)) return router.routeBot(ev);
   const decision = ingestDecision(ev);

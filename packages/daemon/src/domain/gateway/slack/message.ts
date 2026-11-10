@@ -78,6 +78,16 @@ export interface OutboundMessageOpts {
    *  stays quiet-threaded. The value is the Slack USER ID (mention semantics require the id,
    *  never a display name). */
   mentionUserId?: string;
+  /** Per-seat bot tokens: Slack user IDs a `<@U…>` written in the body may name as a LIVE mention
+   *  (registered people only, and only for a seat entry with allowHumanMentions). Every other control
+   *  form (`<!here>`, `<!channel>`, `<!everyone>`, `<!subteam^…>`, other users) stays escaped. Absent or
+   *  empty = today's rule: the body is fully inert. */
+  allowedMentionUserIds?: ReadonlySet<string>;
+  /** Per-seat bot tokens: this post goes out as a seat's own app, which can't receive a button click
+   *  (Slack sends `block_actions` to the posting app; only the shared app has Socket Mode). Questions
+   *  then render as numbered text with lettered options and a typed-reply hint, never an `actions` row.
+   *  Absent = today's render (buttons, or text in a shared channel). */
+  typedAnswersOnly?: boolean;
   /** Stable decision/part identity. Included in the complete fallback budget. */
   reconcileMarker?: string;
   /** A retry that couldn't confirm whether an earlier attempt landed says so in one context line, left out when it
@@ -137,6 +147,11 @@ export const OPTION_ACTION_PREFIX = "or-opt:";
 export const TYPED_REPLY_HINT = "Or reply in this thread with your own answer. A typed reply submits your answer without waiting for every question to be answered.";
 export const CHANNEL_REPLY_HINT = "Reply in this thread with your answer.";
 export const HUMAN_REQUIRED_REPLY_HINT = "Reply in this thread after this question to answer it. Earlier and extra messages still reach the agent as conversation.";
+/** Per-seat bot tokens: an ask posted as a seat's own app has no buttons (Slack sends a click to the
+ *  posting app, and a seat app has no interactivity), so its options are plain text and the answer is
+ *  a typed thread reply. One typed reply answers the whole ask, as TYPED_REPLY_HINT already says. */
+export const SEAT_TYPED_REPLY_HINT = "Reply in this thread to answer: type the letter of your choice (for example \"A\") or your own words. Your first reply is sent as the answer.";
+export const SEAT_TYPED_REPLY_HINT_MANY = "Reply in this thread with one message that answers every question (for example \"1: A, 2: B\"), or in your own words. Your first reply is sent as the whole answer.";
 
 /** Parse a clicked button back into its question and option ids; null if it is not ours. */
 export function parseQuestionAction(blockId: unknown, actionId: unknown): { questionId: string; optionId: string } | null {
@@ -150,16 +165,20 @@ export function parseQuestionAction(blockId: unknown, actionId: unknown): { ques
 /** #193 — the questions as blocks (a section, then a button row, per question) plus the
  *  complete text they must also appear as in the accessible fallback. Without buttons (a shared channel, where a click
  *  records nothing), each question's options are a list and the reader is asked to reply in the thread. */
-function buildQuestionBlocks(questions: readonly HumanQuestion[], buttons = true, resolved = false): { blocks: unknown[]; text: string } {
+function buildQuestionBlocks(questions: readonly HumanQuestion[], buttons = true, resolved = false, typedOnly = false): { blocks: unknown[]; text: string } {
   const blocks: unknown[] = [];
   const lines: string[] = [];
-  for (const q of questions) {
-    const question = bounded(`*${inert(q.question)}*`, SLACK_SECTION_CAP, "question");
-    const options = q.options.map((o) => `• ${inert(o.label)}${o.recommended ? " (recommended)" : ""}`);
+  // Per-seat bot tokens: a typed-only ask numbers its questions (when more than one) and letters its
+  // options, so a short typed reply can name a choice. A shared channel and a resolved notice keep their render.
+  const lettered = typedOnly && buttons && !resolved;
+  for (const [qi, q] of questions.entries()) {
+    const number = lettered && questions.length > 1 ? `${qi + 1}. ` : "";
+    const question = bounded(`*${number}${inert(q.question)}*`, SLACK_SECTION_CAP, "question");
+    const options = q.options.map((o, oi) => `${lettered ? `${String.fromCharCode(65 + oi)}.` : "•"} ${inert(o.label)}${o.recommended ? " (recommended)" : ""}`);
     blocks.push({ type: "section", text: { type: "mrkdwn", text: question } });
     lines.push(question, ...options);
     // A resolved decision keeps its questions as history: options as text, no live buttons, no reply hint.
-    if (!buttons || resolved) {
+    if (!buttons || resolved || lettered) {
       blocks.push({ type: "section", text: { type: "mrkdwn", text: bounded(options.join("\n"), SLACK_SECTION_CAP, "options") } });
       continue;
     }
@@ -176,7 +195,8 @@ function buildQuestionBlocks(questions: readonly HumanQuestion[], buttons = true
     });
   }
   if (resolved) return { blocks, text: lines.join("\n") };
-  const hint = buttons ? TYPED_REPLY_HINT : CHANNEL_REPLY_HINT;
+  const hint = lettered ? (questions.length > 1 ? SEAT_TYPED_REPLY_HINT_MANY : SEAT_TYPED_REPLY_HINT)
+    : buttons ? TYPED_REPLY_HINT : CHANNEL_REPLY_HINT;
   blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: hint }] });
   lines.push(hint);
   return { blocks, text: lines.join("\n") };
@@ -246,7 +266,10 @@ function trimBareUrl(match: string): [url: string, rest: string] {
  *  without colliding with input. A Markdown `[text](url)` or a Slack `<url|text>` / `<url>` becomes
  *  a live link only for a safe https URL without `<`, `>` or `|` and a label (code included)
  *  without `|`; otherwise it stays escaped text. */
-function inlineMarkdownToMrkdwn(line: string): string {
+/** A Slack user ID as Slack writes one in a mention: U… or (Enterprise Grid) W…. */
+const USER_ID = /^[UW][A-Z0-9]{2,}$/;
+
+function inlineMarkdownToMrkdwn(line: string, mentions?: ReadonlySet<string>): string {
   const held: string[] = [];
   const hold = (rendered: string) => `<${held.push(rendered) - 1}>`;
   const restore = (s: string) => s.replace(/<(\d+)>/g, (_, i: string) => held[Number(i)] ?? "");
@@ -258,6 +281,9 @@ function inlineMarkdownToMrkdwn(line: string): string {
   };
   return restore(escapeSlackText(line)
     .replace(/`[^`\n]+`/g, hold)
+    // Per-seat bot tokens: an allowed person's bare mention, after code spans are set aside (a mention
+    // in code stays text). Only the exact `<@ID>` form; `<@ID|label>` and every `<!…>` stay escaped.
+    .replace(/&lt;@([UW][A-Z0-9]{2,})&gt;/g, (m, id: string) => (mentions?.has(id) && USER_ID.test(id) ? hold(`<@${id}>`) : m))
     .replace(/\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g, (m, label: string, url: string) => link(m, url, label))
     .replace(/&lt;(https:\/\/[^\s|]+?)(?:\|(.+?))?&gt;/g, (m, url: string, label?: string) => link(m, url, label))
     // A bare URL is held as written: Slack links it, and `__` or `**` inside it is not bold.
@@ -272,7 +298,7 @@ function inlineMarkdownToMrkdwn(line: string): string {
 const FENCE_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
 
 /** One pass over the lines: the converted text, and the fence still open at its end ("" if none). */
-function convertMarkdown(text: string, openFence: string): { text: string; openFence: string } {
+function convertMarkdown(text: string, openFence: string, mentions?: ReadonlySet<string>): { text: string; openFence: string } {
   let fence = openFence;
   const lines = redactSecrets(text).split("\n").map((line) => {
     const marker = FENCE_PATTERN.exec(line)?.[1];
@@ -287,16 +313,16 @@ function convertMarkdown(text: string, openFence: string): { text: string; openF
     const heading = /^#{1,6}\s+(.*?)(?:\s+#+)?\s*$/.exec(line);
     if (heading) {
       if (!heading[1]) return "";
-      const inner = inlineMarkdownToMrkdwn(heading[1]);
+      const inner = inlineMarkdownToMrkdwn(heading[1], mentions);
       return /^\*[^*\n]+\*$/.test(inner) ? inner : `*${inner}*`;
     }
     // Section mrkdwn has no list syntax; a plain "- " reads better than a typed bullet character.
     const item = /^(\s*)[-*+]\s+(.*)$/.exec(line);
     if (item) {
       const [, indent = "", rest = ""] = item;
-      return `${indent}- ${inlineMarkdownToMrkdwn(rest)}`;
+      return `${indent}- ${inlineMarkdownToMrkdwn(rest, mentions)}`;
     }
-    return inlineMarkdownToMrkdwn(line);
+    return inlineMarkdownToMrkdwn(line, mentions);
   });
   return { text: lines.join("\n"), openFence: fence };
 }
@@ -307,8 +333,8 @@ function convertMarkdown(text: string, openFence: string): { text: string; openF
  *  `[text](url)` and `<url|text>` links live links. A list marker needs a following space, so
  *  `*bold*` is not a list item. Code spans and ``` or ~~~ fenced blocks are only escaped. `openFence` is the
  *  fence a split brief's earlier part left open (see openFenceAfter). */
-export function markdownToSlackMrkdwn(text: string, openFence = ""): string {
-  const converted = convertMarkdown(text, openFence);
+export function markdownToSlackMrkdwn(text: string, openFence = "", mentions?: ReadonlySet<string>): string {
+  const converted = convertMarkdown(text, openFence, mentions);
   // Slack knows only ``` blocks, and only inside one message: a part that starts or ends inside one is wrapped to match.
   const head = openFence.startsWith("`") ? "```\n" : "";
   const tail = converted.openFence.startsWith("`") ? "\n```" : "";
@@ -325,15 +351,16 @@ export function openFenceAfter(text: string, openFence = ""): string {
 
 type RichInline =
   | { type: "text"; text: string; style?: { bold?: boolean; code?: boolean } }
-  | { type: "link"; url: string; text?: string };
+  | { type: "link"; url: string; text?: string }
+  | { type: "user"; user_id: string };
 
 // Code spans, Markdown links, Slack links, bare https URLs, then **bold**, __bold__ and *bold*.
-const RICH_INLINE = /`([^`\n]+)`|\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)|<(https:\/\/[^\s|>]+)(?:\|([^>\n]+))?>|(https:\/\/[^\s<>|`]+)|\*\*(?=\S)(.+?)(?<=\S)\*\*|__(?=\S)(.+?)(?<=\S)__|\*(?=\S)([^*\n]+?)(?<=\S)\*/g;
+const RICH_INLINE = /`([^`\n]+)`|\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)|<(https:\/\/[^\s|>]+)(?:\|([^>\n]+))?>|(https:\/\/[^\s<>|`]+)|\*\*(?=\S)(.+?)(?<=\S)\*\*|__(?=\S)(.+?)(?<=\S)__|\*(?=\S)([^*\n]+?)(?<=\S)\*|<@([UW][A-Z0-9]{2,})>/g;
 
 /** One already-redacted list item as rich text elements. Rich text is never parsed for
  *  mentions or links, so plain text needs no escaping; a link element is emitted only for a
  *  URL that passes the same checks as a mrkdwn link. */
-function richInline(text: string): RichInline[] {
+function richInline(text: string, mentions?: ReadonlySet<string>): RichInline[] {
   const out: RichInline[] = [];
   const plain = (t: string) => {
     const last = out.at(-1);
@@ -344,12 +371,17 @@ function richInline(text: string): RichInline[] {
   let at = 0;
   for (let m = re.exec(text); m; m = re.exec(text)) {
     plain(text.slice(at, m.index));
-    const [all, code, mdLabel, mdUrl, slackUrl, slackLabel, bare, b1, b2, b3] = m;
+    const [all, code, mdLabel, mdUrl, slackUrl, slackLabel, bare, b1, b2, b3, mentionId] = m;
     const url = mdUrl ?? slackUrl;
     const label = mdLabel ?? slackLabel;
     const bold = b1 ?? b2 ?? b3;
     at = m.index + all.length;
     if (code !== undefined) out.push({ type: "text", text: code, style: { code: true } });
+    else if (mentionId !== undefined) {
+      // Rich text never parses `<@…>` from text; an allowed person becomes a native user element.
+      if (mentions?.has(mentionId)) out.push({ type: "user", user_id: mentionId });
+      else plain(all);
+    }
     else if (bare !== undefined) {
       const [target] = trimBareUrl(bare);
       if (isSafeHttpsUrl(target)) out.push({ type: "link", url: target });
@@ -358,7 +390,7 @@ function richInline(text: string): RichInline[] {
       at = re.lastIndex = m.index + target.length;
     } else if (bold !== undefined) {
       // Bold content is parsed again, so a link inside stays a link and the text around it is bold.
-      for (const el of richInline(bold)) out.push(el.type === "text" ? { ...el, style: { ...el.style, bold: true } } : el);
+      for (const el of richInline(bold, mentions)) out.push(el.type === "text" ? { ...el, style: { ...el.style, bold: true } } : el);
     } else if (url !== undefined && isSafeHttpsUrl(url) && !/[<>|]/.test(url)) out.push(label ? { type: "link", url, text: label } : { type: "link", url });
     else plain(all);
   }
@@ -372,7 +404,7 @@ const MAX_LIST_INDENT = 4;
 
 /** The body as blocks: runs of list items (outside code fences) become one native `rich_text`
  *  list block each; everything else stays mrkdwn sections. Nesting is two spaces per level. */
-export function buildBodyBlocks(text: string, openFence = ""): unknown[] {
+export function buildBodyBlocks(text: string, openFence = "", mentions?: ReadonlySet<string>): unknown[] {
   type List = { type: "rich_text_list"; style: "bullet" | "ordered"; indent: number; offset?: number; elements: unknown[] };
   const blocks: unknown[] = [];
   let fence = openFence;
@@ -383,7 +415,7 @@ export function buildBodyBlocks(text: string, openFence = ""): unknown[] {
     const source = run.join("\n");
     run = [];
     if (!source.trim()) return;
-    const converted = markdownToSlackMrkdwn(source, runFence);
+    const converted = markdownToSlackMrkdwn(source, runFence, mentions);
     if (converted.trim()) blocks.push({ type: "section", text: { type: "mrkdwn", text: bounded(converted, SLACK_SECTION_CAP, "body") } });
   };
   const flushLists = () => {
@@ -397,7 +429,7 @@ export function buildBodyBlocks(text: string, openFence = ""): unknown[] {
       const [, lead = "", bullet, number, rest = ""] = item;
       const style = bullet ? "bullet" : "ordered";
       const indent = Math.min(MAX_LIST_INDENT, Math.floor(lead.replaceAll("\t", "  ").length / 2));
-      const section = { type: "rich_text_section", elements: richInline(rest) };
+      const section = { type: "rich_text_section", elements: richInline(rest, mentions) };
       const last = lists.at(-1);
       if (last && last.style === style && last.indent === indent) last.elements.push(section);
       // An ordered run keeps its own numbering (a list starting at 5, or resuming after a nested list or a split).
@@ -584,7 +616,7 @@ export function buildOutboundMessage(q: QitemLike, opts: OutboundMessageOpts): S
     ? (!gateEvidence || gateEvidenceCarried
       ? ""
       : bounded(`Evidence: ${inert(gateEvidence)}`, SLACK_SECTION_CAP, "body"))
-    : bounded(markdownToSlackMrkdwn(String(q.body || ""), q.bodyOpenFence ?? ""), SLACK_SECTION_CAP, "body");
+    : bounded(markdownToSlackMrkdwn(String(q.body || ""), q.bodyOpenFence ?? "", opts.allowedMentionUserIds), SLACK_SECTION_CAP, "body");
   const mention = opts.mentionUserId ? `<@${opts.mentionUserId}> :rotating_light: ` : "";
   const headline = bounded(`${mention}*${summary}*`, SLACK_SECTION_CAP, "subject");
   const machine = opts.attribution && !opts.attribution.host && opts.machine ? ` on ${inert(opts.machine)}` : "";
@@ -593,7 +625,7 @@ export function buildOutboundMessage(q: QitemLike, opts: OutboundMessageOpts): S
   const attachmentText = imageBlocks.map((b) => `Image: ${(b as { alt_text: string }).alt_text}`).join("\n");
   const evidence = buildEvidenceLink(opts.evidenceLink);
   const resolvedDecision = q.ownerNotificationKind === "human-decision-resolved";
-  const questionParts = q.humanQuestions?.length ? buildQuestionBlocks(q.humanQuestions, !q.sharedChannel, resolvedDecision) : null;
+  const questionParts = q.humanQuestions?.length ? buildQuestionBlocks(q.humanQuestions, !q.sharedChannel, resolvedDecision, opts.typedAnswersOnly === true) : null;
   if (opts.extraBlocks?.length) {
     throw new HumanMessageShapeError("Extra blocks have no complete accessible fallback. Use mediaRefs for images or author supplemental human detail.");
   }
@@ -616,7 +648,7 @@ export function buildOutboundMessage(q: QitemLike, opts: OutboundMessageOpts): S
   if (repeatBlock) blocks.push(repeatBlock);
   if (shownContext) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: shownContext }] });
   const bodySection = { type: "section", text: { type: "mrkdwn", text: body } };
-  const bodyBlocks = !body.trim() ? [] : humanGate ? [bodySection] : buildBodyBlocks(String(q.body || ""), q.bodyOpenFence ?? "");
+  const bodyBlocks = !body.trim() ? [] : humanGate ? [bodySection] : buildBodyBlocks(String(q.body || ""), q.bodyOpenFence ?? "", opts.allowedMentionUserIds);
   const bodyAt = blocks.length;
   blocks.push(...bodyBlocks);
   if (questionParts) blocks.push(...questionParts.blocks);

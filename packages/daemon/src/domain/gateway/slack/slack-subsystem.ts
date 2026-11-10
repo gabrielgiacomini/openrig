@@ -19,7 +19,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { buildInProcessWire, type GatewayWire, type SubsystemDeliverFn } from "../gateway-subsystem.js";
 import { DispatchBuffer } from "../dispatch-buffer.js";
-import { downloadPrivateFile, isSlackHost, lookupBotApp, postChatMessage } from "./slack-api.js";
+import { downloadPrivateFile, identifyBot, isSlackHost, lookupBotApp, postChatMessage } from "./slack-api.js";
+import { SeatIdentities, loadSeatPosters, resolveSeatPoster } from "./seat-tokens.js";
 import { botInboxProblems } from "./bot-inbox.js";
 import { loadConfig } from "./config.js";
 import { resolveSecret } from "./secrets.js";
@@ -319,6 +320,21 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   }
 
   const registrySurface: RegistrySurface = opts.registry ?? { loadHumanRegistry, resolveSlackHandle };
+  // Per-seat bot tokens (seat-tokens.ts): seats whose channel-map entry names its own bot token post as
+  // that app. Loaded once per wire build; any entry that can't load posts with the shared token and is
+  // named here and in `rig slack status`. Token values never reach a log.
+  const seatLoad = cfg.enabled && bot ? loadSeatPosters(cfg, { sharedToken: bot }) : { posters: [], problems: [] };
+  for (const problem of seatLoad.problems) log(`slack seat bots: ${problem}`);
+  if (seatLoad.posters.length) log(`slack seat bots: ${seatLoad.posters.length} seat(s) post with their own bot token (${seatLoad.posters.map((p) => p.match).join(", ")})`);
+  const seatIdentities = new SeatIdentities(seatLoad.posters);
+  // People a seat bot may mention live: the registered humans' Slack user IDs, read at post time.
+  const registeredSlackUserIds = (): ReadonlySet<string> => {
+    const reg = registrySurface.loadHumanRegistry(opts.home);
+    if (!reg.ok) return new Set();
+    return new Set(reg.entities.flatMap((e) => e.connectorBindings
+      .filter((b) => b.kind === "slack" && typeof b.handle === "string" && /^[UW][A-Z0-9]{2,}$/.test(b.handle))
+      .map((b) => b.handle as string)));
+  };
   const ports = makeQueuePorts(opts.queueRepo, {
     loadHumanRegistry: () => registrySurface.loadHumanRegistry(opts.home),
     sharedChannels: () => sharedChannelAddresses(opts.home),
@@ -510,6 +526,18 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   const deliver = outboundReady
     ? subsystemSlackDeliver({
         botToken: bot!,
+        // Per-seat bot tokens: a seat with its own token posts as its own app, asks included. Slack sends a
+        // click to the app that posted the message and a seat app has no Socket Mode, so a seat's ask renders
+        // without buttons and is answered by a typed thread reply, which the shared socket hears and routes
+        // by (channel, thread_ts) like any reply. A digest has no seat and stays shared.
+        ...(seatLoad.posters.length ? {
+          resolvePoster: (p: OutboundPostPayload) => {
+            if ((p as { deliveryDigestPost?: boolean }).deliveryDigestPost) return undefined;
+            const seat = resolveSeatPoster(seatLoad.posters, p.sourceSession);
+            if (!seat) return undefined;
+            return { token: seat.token, label: seat.match, ...(seat.allowHumanMentions ? { allowedMentionUserIds: registeredSlackUserIds() } : {}) };
+          },
+        } : {}),
         channel: cfg.channel!,
         // #192: a reply-to update whose choice is already recorded posts in that choice's channel:
         // the one it names, or, for a choice recorded without one (before any map existed), the
@@ -1007,7 +1035,40 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   // hermeticity rule, same as every monitor in the supervision tree.
   const stops: Array<() => void> = [];
   const starts: Array<() => void> = [];
-  const settlement = outboundReady ? new SlackAskSettlement({ queue: opts.queueRepo, token: bot!, fetchImpl: opts.fetchImpl, log }) : null;
+  const settlement = outboundReady ? new SlackAskSettlement({
+    queue: opts.queueRepo,
+    token: bot!,
+    // chat.update works only for the bot that posted: the seat's own token first, then the shared one.
+    ...(seatLoad.posters.length ? { updateTokensFor: (seat: string) => {
+      const own = resolveSeatPoster(seatLoad.posters, seat);
+      return own ? [own.token, bot!] : [bot!];
+    } } : {}),
+    fetchImpl: opts.fetchImpl,
+    log,
+  }) : null;
+  if (seatLoad.posters.length) {
+    // Learn each seat app's bot user, bot ID and app (auth.test, then bots.info), so its posts are dropped
+    // inbound by every ID Slack may carry. A configured appId already covers the app before this answers.
+    starts.push(() => {
+      for (const poster of seatLoad.posters) {
+        void (async () => {
+          const who = await identifyBot(poster.token, opts.fetchImpl);
+          if (!who.ok) { log(`slack seat bot ${poster.match}: auth.test failed (${who.error}); its posts are still dropped as bot posts`); return; }
+          let appId = who.appId;
+          if (!appId && who.botId) {
+            const found = await lookupBotApp(poster.token, who.botId, opts.fetchImpl);
+            if (found.ok) appId = found.appId;
+            else log(`slack seat bot ${poster.match}: bots.info failed (${found.error}); dropping by bot and user ID`);
+          }
+          seatIdentities.learn({ appId, botId: who.botId, userId: who.userId });
+          if (poster.appId && appId && appId !== poster.appId) {
+            log(`slack seat bot ${poster.match}: WARNING configured appId ${poster.appId} but the token belongs to ${appId}; both are dropped inbound`);
+          }
+          log(`slack seat bot ${poster.match}: posts as user ${who.userId ?? "?"} bot ${who.botId ?? "?"} app ${appId ?? "?"}`);
+        })().catch((e: unknown) => log(`slack seat bot ${poster.match}: identity lookup failed: ${(e as Error).message}`));
+      }
+    });
+  }
   if (settlement) {
     starts.push(() => settlement.start());
     stops.push(() => settlement.stop());
@@ -1119,6 +1180,8 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
           log,
         }),
       } : {}),
+      // Per-seat bot tokens: the seat apps' own posts are OpenRig's, never a person's or a named bot's.
+      ...(seatLoad.posters.length ? { seatIdentities } : {}),
       // Named-bot delivery: wired only with a valid botInbox and the bot token bots.info needs.
       ...(cfg.botInbox && bot && botInboxProblems(cfg).length === 0 ? {
         botInbox: {
